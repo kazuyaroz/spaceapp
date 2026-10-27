@@ -13,6 +13,7 @@ import {
 import { availableParallelism, homedir, totalmem } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { composeInvocation } from "./container-engine.mjs";
 import {
   normalizeWorkspaceName,
   stripTrailingLineEndings
@@ -909,7 +910,8 @@ export function composeCommand(action, root, options = {}) {
   if (!selected) {
     throw new Error(`Unsupported Compose action "${action}".`);
   }
-  return { command: "docker", args: [...base, ...selected] };
+  const { command, args } = composeInvocation([...base, ...selected]);
+  return { command, args };
 }
 
 export function composeProjectName(root) {
