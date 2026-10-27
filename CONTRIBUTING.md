@@ -118,3 +118,35 @@ which certifies the [Developer Certificate of Origin 1.1](https://developercerti
 that you wrote the contribution or have the right to submit it under the MIT
 License. `git commit -s` adds the line. There is no separate contributor
 license agreement.
+
+## Running the full stack from source
+
+Start the API, web and worker dev servers together with one command:
+
+```sh
+npm run dev
+```
+
+This spawns all three workspaces concurrently and prefixes each service's
+output with its name (`[api]`, `[web]`, `[worker]`). Press Ctrl-C to stop
+everything.
+
+Individual services can still be started on their own:
+
+```sh
+npm run dev:api     # API only
+npm run dev:web     # Web only
+npm run dev:worker  # Worker only
+```
+
+### External dependencies
+
+PostgreSQL and Temporal are **optional** for local development:
+
+- The API defaults to the in-memory runtime store when `SPACE_DATABASE_URL`
+  is not set.
+- The worker degrades gracefully when Temporal is unreachable.
+
+To use real services, set `SPACE_DATABASE_URL` and `SPACE_TEMPORAL_ADDRESS`
+before running `npm run dev`. See `apps/api/src/config.ts` for the full
+configuration reference.
