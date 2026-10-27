@@ -1,5 +1,19 @@
 # syntax=docker/dockerfile:1.7
 
+# =============================================================================
+# SpaceApp — per-service container images
+#
+# Each published image (core, cli, browser) builds from its own stage that
+# copies only the workspaces and files that service actually needs.
+# The previous monolithic runtime-base stage copied the entire monorepo output
+# into every image; this file removes that stage.
+#
+# Build targets:
+#   docker build --target core    -t spaceapp-core   .
+#   docker build --target cli     -t spaceapp-cli    .
+#   docker build --target browser -t spaceapp-browser .
+# =============================================================================
+
 FROM node:22.23.0-trixie-slim@sha256:cfd8f2a5bc50526aee08e88970979f92722828e7dcc6d8983607fb8bff4bdb82 AS build
 WORKDIR /app
 RUN apt-get update \
@@ -11,6 +25,10 @@ RUN npm ci --no-audit --no-fund \
     && npm prune --omit=dev \
     && find node_modules -type f \( -name '*.js.map' -o -name '*.mjs.map' -o -name '*.cjs.map' -o -name '*.css.map' \) -delete
 
+# =============================================================================
+# Shared runtime layer — OS packages, user, npm security patches.
+# No application code is copied here; each service stage copies its own subset.
+# =============================================================================
 FROM node:22.23.0-trixie-slim@sha256:cfd8f2a5bc50526aee08e88970979f92722828e7dcc6d8983607fb8bff4bdb82 AS runtime-base
 ARG TARGETARCH
 ARG NPM_VERSION=11.18.0
@@ -54,25 +72,30 @@ RUN npm install --global --ignore-scripts --no-audit --no-fund "npm@${NPM_VERSIO
     && groupadd --gid 10001 spaceapp \
     && useradd --uid 10001 --gid 10001 --create-home --home-dir /var/lib/spaceapp-cli --shell /bin/bash spaceapp
 WORKDIR /app
+
+# =============================================================================
+# CORE — API + web server + Temporal worker
+# Copies: apps/{api,web,worker}, shared packages, deploy scripts
+# =============================================================================
+FROM runtime-base AS core
 COPY --from=build --chown=spaceapp:spaceapp /app/package.json /app/package-lock.json ./
-COPY --from=build --chown=spaceapp:spaceapp /app/node_modules ./node_modules
-COPY --from=build --chown=spaceapp:spaceapp /app/apps ./apps
-COPY --from=build --chown=spaceapp:spaceapp /app/packages ./packages
-COPY --from=build --chown=spaceapp:spaceapp /app/agent-skills ./agent-skills
-COPY --from=build --chown=spaceapp:spaceapp /app/LICENSE /app/NOTICE /app/THIRD_PARTY_NOTICES.md ./
-COPY --from=build --chown=spaceapp:spaceapp /app/THIRD_PARTY_LICENSES ./THIRD_PARTY_LICENSES
+COPY --from=build --chown=spaceapp:spaceapp /app/apps/api ./apps/api
+COPY --from=build --chown=spaceapp:spaceapp /app/apps/web ./apps/web
+COPY --from=build --chown=spaceapp:spaceapp /app/apps/worker ./apps/worker
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/contracts ./packages/contracts
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/db ./packages/db
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/runtime ./packages/runtime
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/gateway ./packages/gateway
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/streaming ./packages/streaming
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/icons ./packages/icons
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/memory-graph ./packages/memory-graph
 COPY --from=build --chown=spaceapp:spaceapp /app/scripts/reset-owner-password.mjs ./scripts/reset-owner-password.mjs
 COPY --from=build --chown=spaceapp:spaceapp /app/scripts/rotate-owner-setup-token.mjs ./scripts/rotate-owner-setup-token.mjs
 COPY --from=build --chown=spaceapp:spaceapp /app/scripts/portable-backup.mjs ./scripts/portable-backup.mjs
 COPY --from=build --chown=spaceapp:spaceapp /app/scripts/portable-restore.mjs ./scripts/portable-restore.mjs
 COPY --chown=spaceapp:spaceapp deploy/docker ./deploy/docker
-RUN chmod 0755 deploy/docker/core-entrypoint.sh deploy/docker/browser-entrypoint.sh deploy/docker/cli-entrypoint.sh \
-    && install -m 0755 deploy/docker/public-cli-wrapper.sh /usr/local/bin/spaceapp-cli-wrapper \
-    && for name in codex claude gemini opencode qwen kimi grok deepseek autohand cursor copilot; do \
-         ln -s /usr/local/bin/spaceapp-cli-wrapper "/usr/local/bin/${name}-vscode-parity"; \
-       done
-
-FROM runtime-base AS core
+COPY --from=build --chown=spaceapp:spaceapp /app/LICENSE /app/NOTICE /app/THIRD_PARTY_NOTICES.md ./
+COPY --from=build --chown=spaceapp:spaceapp /app/THIRD_PARTY_LICENSES ./THIRD_PARTY_LICENSES
 COPY --chown=spaceapp:spaceapp starter-memory /opt/spaceapp/starter-memory
 # The Databases tool's SQLite worker (apps/api/src/databases/sqlite-worker.py) needs Python 3.12+ with its sqlite3 module;
 # python3-minimal has no sqlite3 (1.1.7 review: SQLite could not run in public installations).
@@ -80,6 +103,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -c 'import sqlite3, sys; assert sys.version_info >= (3, 12)'
+RUN chmod 0755 deploy/docker/core-entrypoint.sh deploy/docker/browser-entrypoint.sh deploy/docker/cli-entrypoint.sh \
+    && install -m 0755 deploy/docker/public-cli-wrapper.sh /usr/local/bin/spaceapp-cli-wrapper \
+    && for name in codex claude gemini opencode qwen kimi grok deepseek autohand cursor copilot; do \
+         ln -s /usr/local/bin/spaceapp-cli-wrapper "/usr/local/bin/${name}-vscode-parity"; \
+       done
 RUN install -d -o spaceapp -g spaceapp -m 0700 \
       /var/lib/spaceapp \
       /var/lib/spaceapp/artifacts \
@@ -90,7 +118,17 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=45s --retries=5 \
   CMD ["node", "-e", "fetch('http://127.0.0.1:4911/readyz').then(async r=>{const body=await r.json();if(!r.ok||body.ok !== true)process.exit(1)}).catch(()=>process.exit(1))"]
 ENTRYPOINT ["/app/deploy/docker/core-entrypoint.sh"]
 
+# =============================================================================
+# BROWSER — Browser Host + Chromium
+# Copies: packages/{browser-host,runtime,contracts}, deploy scripts
+# =============================================================================
 FROM runtime-base AS browser
+COPY --from=build --chown=spaceapp:spaceapp /app/package.json /app/package-lock.json ./
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/browser-host ./packages/browser-host
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/runtime ./packages/runtime
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/contracts ./packages/contracts
+COPY --chown=spaceapp:spaceapp deploy/docker ./deploy/docker
+COPY --from=build --chown=spaceapp:spaceapp /app/LICENSE /app/NOTICE /app/THIRD_PARTY_NOTICES.md ./
 RUN apt-get update \
     && apt-get install -y --no-install-recommends chromium fonts-liberation liblzma5 \
     && rm -rf /var/lib/apt/lists/* \
@@ -102,9 +140,20 @@ ENV SPACE_BROWSER_CHROME_PATH=/usr/bin/chromium \
     SPACE_BROWSER_SESSIONS_CHROME_PATH=/usr/bin/chromium
 ENTRYPOINT ["/app/deploy/docker/browser-entrypoint.sh"]
 
+# =============================================================================
+# CLI — CLI host that runs AI coding CLIs in PTYs
+# Copies: packages/{cli-host,runtime,contracts,opencode-control}, deploy, starter-memory
+# =============================================================================
 FROM runtime-base AS cli
+COPY --from=build --chown=spaceapp:spaceapp /app/package.json /app/package-lock.json ./
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/cli-host ./packages/cli-host
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/runtime ./packages/runtime
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/contracts ./packages/contracts
+COPY --from=build --chown=spaceapp:spaceapp /app/packages/opencode-control ./packages/opencode-control
+COPY --chown=spaceapp:spaceapp deploy/docker ./deploy/docker
 COPY --chown=root:root starter-memory/AGENTS.md /etc/AGENTS.md
 COPY --chown=root:root starter-memory/installation-guide.md /etc/spaceapp-installation-guide.md
+COPY --from=build --chown=spaceapp:spaceapp /app/LICENSE /app/NOTICE /app/THIRD_PARTY_NOTICES.md ./
 RUN chmod 0644 /etc/AGENTS.md
 ARG TARGETARCH
 # python3-minimal (about 13 MB): agents often check their work with a short python3 script (pilot F18).
